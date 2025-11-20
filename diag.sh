@@ -62,7 +62,7 @@ fi
 # 4. SERVICES & PROCESSUS
 echo -e "\n${YELLOW}[4] SERVICES CRITIQUES${NC}"
 # Vérification des services communs
-for service in ssh apache2 nginx mysql mariadb grafana-server php7.3-fpm php8.1-fpm docker; do
+for service in ssh apache2 mysql mariadb grafana-server php7.3-fpm php8.1-fpm; do
     systemctl is-active --quiet $service && echo -e "$service : ${GREEN}ACTIF${NC}" || echo -e "$service : ${RED}INACTIF ou NON INSTALLÉ${NC}"
 done
 
