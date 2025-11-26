@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================================
-# DIAGNOSTIC SYSTÈME & IMPRIMANTE (V5.0)
+# DIAGNOSTIC SYSTÈME & IMPRIMANTE (V5.1)
 # ==========================================================
 
 # 0. VÉRIFICATION ROOT
@@ -35,7 +35,7 @@ PURPLE='\033[0;35m'
 NC='\033[0m'
 
 echo -e "${BLUE}==========================================================${NC}"
-echo -e "${BLUE}       DIAGNOSTIC SYSTÈME - $MACHINE_TYPE (V5.0)          ${NC}"
+echo -e "${BLUE}       DIAGNOSTIC SYSTÈME - $MACHINE_TYPE (V5.1)          ${NC}"
 echo -e "${BLUE}==========================================================${NC}"
 date
 echo ""
@@ -44,7 +44,6 @@ echo ""
 echo -e "${YELLOW}[1] SYSTÈME & HORLOGE${NC}"
 
 if [ "$IS_RPI" = true ]; then
-    # Correction du bug "octet nul" avec tr -d '\0'
     MODEL=$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')
 else
     MODEL=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || hostnamectl | grep "Chassis" | awk '{print $2}')
@@ -63,23 +62,14 @@ fi
 
 # 2. SANTÉ MATÉRIELLE
 echo -e "\n${YELLOW}[2] SANTÉ MATÉRIELLE${NC}"
-
 if [ "$IS_RPI" = true ]; then
     TEMP=$(vcgencmd measure_temp | egrep -o '[0-9]*\.[0-9]*')
     STATUS=$(vcgencmd get_throttled | awk -F= '{print $2}')
     STATUS_DEC=$((STATUS))
-    
     if (( $(echo "$TEMP > 75.0" | bc -l) )); then C=$RED; elif (( $(echo "$TEMP > 60.0" | bc -l) )); then C=$YELLOW; else C=$GREEN; fi
     echo -e "Température CPU : ${C}${TEMP}°C${NC}"
-
     echo -n "Alimentation    : "
-    if [[ "$STATUS" == "0x0" ]]; then
-        echo -e "${GREEN}Parfaite (0x0)${NC}"
-    else
-        echo -e "${RED}PROBLÈME ($STATUS)${NC}"
-        if (( (STATUS_DEC & 0x1) != 0 )); then echo -e "   -> ${RED}ACTUELLEMENT en sous-tension !${NC}"; fi
-        if (( (STATUS_DEC & 0x10000) != 0 )); then echo -e "   -> ${YELLOW}Sous-tension historique${NC}"; fi
-    fi
+    if [[ "$STATUS" == "0x0" ]]; then echo -e "${GREEN}Parfaite (0x0)${NC}"; else echo -e "${RED}PROBLÈME ($STATUS)${NC}"; fi
 else
     echo -e "Température CPU : (Mode PC - Non affiché)"
 fi
@@ -91,7 +81,6 @@ if grep -q "ro," /proc/mounts | grep -w "/" | grep -q "ext4"; then
 else
     echo -e "Mode Écriture   : ${GREEN}RW (OK)${NC}"
 fi
-
 df -h / | awk 'NR==2 {
     usage=$5; sub("%", "", usage);
     if (usage > 90) c="\033[0;31m"; else if (usage > 75) c="\033[1;33m"; else c="\033[0;32m";
@@ -101,7 +90,6 @@ df -h / | awk 'NR==2 {
 # 4. MÉMOIRE & PROCESSUS
 echo -e "\n${YELLOW}[4] MÉMOIRE & PROCESSUS${NC}"
 free -h | awk 'NR==2{printf "RAM             : %s / %s (Libre: %s)\n", $3,$2,$4}'
-
 echo -e "${PURPLE}--- Top 3 CPU ---${NC}"
 echo "PID    %CPU  %MEM  PROCESSUS"
 ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -n 4 | tail -n 3 | awk '{printf "%-6s %-5s %-5s %s\n", $1, $2"%", $3"%", $4}'
@@ -109,71 +97,78 @@ ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -n 4 | tail -n 3 | awk '{printf "%
 # 5. RÉSEAU
 echo -e "\n${YELLOW}[5] RÉSEAU${NC}"
 hostname -I | awk '{print "IP Locale       : " $1}'
+if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then echo -e "Internet        : ${GREEN}Connecté${NC}"; else echo -e "Internet        : ${RED}DÉCONNECTÉ${NC}"; fi
 
-if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
-    echo -e "Internet        : ${GREEN}Connecté${NC}"
-else
-    echo -e "Internet        : ${RED}DÉCONNECTÉ${NC}"
-fi
-
-# 6. IMPRIMANTE TG2460 (CUSTOM)
+# 6. IMPRIMANTE TG2460 (AMÉLIORÉ)
 echo -e "\n${YELLOW}[6] IMPRIMANTE TG2460${NC}"
 
-# Recherche du binaire ReadStatus
-TG_BIN=$(find /home -name "ReadStatus" -type f 2>/dev/null | head -n 1)
-
-if [ -z "$TG_BIN" ]; then
-    echo -e "Programme       : ${RED}Non trouvé (ReadStatus introuvable)${NC}"
+# Check USB (VID:PID 0DD4:0195)
+if lsusb | grep -qi "0dd4:0195"; then
+    USB_MSG="${GREEN}OK (Connecté)${NC}"
 else
-    TG_DIR=$(dirname "$TG_BIN")
-    echo -e "Chemin          : $TG_DIR"
+    USB_MSG="${RED}NON DÉTECTÉE${NC}"
+fi
+echo -e "Connexion USB   : $USB_MSG"
+
+# Stratégie intelligente pour trouver le dossier
+PID_TG=$(pgrep -f "ReadStatus" | tr '\n' ' ' | xargs) # xargs enlève les espaces en trop
+TG_DIR=""
+
+if [ ! -z "$PID_TG" ]; then
+    # Cas 1 : Le processus tourne, on trouve son dossier source
+    FIRST_PID=$(echo $PID_TG | awk '{print $1}')
+    # On lit le lien symbolique /proc/PID/exe pour avoir le vrai chemin
+    BIN_PATH=$(readlink -f /proc/$FIRST_PID/exe 2>/dev/null)
+    TG_DIR=$(dirname "$BIN_PATH")
+    echo -e "Processus       : ${GREEN}EN COURS (PID $PID_TG)${NC}"
+else
+    # Cas 2 : Processus éteint, on cherche avec find en évitant les backups (b.*)
+    TG_BIN=$(find /home -name "ReadStatus" -type f 2>/dev/null | grep -v "/b\." | head -n 1)
+    if [ ! -z "$TG_BIN" ]; then
+        TG_DIR=$(dirname "$TG_BIN")
+    fi
+    echo -e "Processus       : ${YELLOW}ARRÊTÉ${NC}"
+fi
+
+if [ -z "$TG_DIR" ]; then
+    echo -e "Dossier         : ${RED}Introuvable${NC}"
+else
+    echo -e "Dossier Actif   : $TG_DIR"
     
-    # Check USB (VID:PID 0DD4:0195)
-    if lsusb | grep -qi "0dd4:0195"; then
-        echo -e "Connexion USB   : ${GREEN}OK (Périphérique détecté)${NC}"
-    else
-        echo -e "Connexion USB   : ${RED}NON DÉTECTÉE (Vérifier câble)${NC}"
-    fi
-
-    # Config
+    # Lecture Config plus robuste (awk + trim)
     if [ -f "$TG_DIR/printer.cfg" ]; then
-        API_HOST=$(grep "API_HOST" "$TG_DIR/printer.cfg" | cut -d= -f2 | tr -d '\r')
-        echo -e "Cible API       : $API_HOST"
+        # On utilise awk pour gérer les espaces potentiels autour du =
+        API_HOST=$(awk -F= '/API_HOST/ {print $2}' "$TG_DIR/printer.cfg" | tr -d ' "[:space:]')
+        echo -e "Cible API       : ${CYAN}$API_HOST${NC}"
+    else
+        echo -e "Cible API       : ${RED}Fichier printer.cfg absent${NC}"
     fi
 
-    # Check Processus
-    PID_TG=$(pgrep -f "ReadStatus")
-    if [ ! -z "$PID_TG" ]; then
-        echo -e "Processus       : ${GREEN}EN COURS (PID $PID_TG)${NC}"
-    else
-        echo -e "Processus       : ${YELLOW}ARRÊTÉ${NC}"
+    # Si le processus est arrêté, on lance le test
+    if [ -z "$PID_TG" ]; then
         echo -e "${PURPLE}--- Test de lancement (3 sec) ---${NC}"
-        
-        # Test Dry Run
         cd "$TG_DIR"
         timeout 3s ./ReadStatus > /tmp/tg_debug.log 2>&1
         
-        # Analyse du log
         if grep -q "CeSmLm.so version" /tmp/tg_debug.log; then
-            VER=$(grep "CeSmLm.so version" /tmp/tg_debug.log)
-            echo -e "Version Lib     : ${GREEN}$VER${NC}"
+            echo -e "Version Lib     : ${GREEN}OK${NC}"
         fi
         
-        STATUS_LINE=$(grep "Changement status" /tmp/tg_debug.log | tail -n 1)
+        # Récupération du dernier statut propre
+        STATUS_LINE=$(grep "Changement status" /tmp/tg_debug.log | tail -n 1 | awk -F'=> ' '{print $2}')
         if [ ! -z "$STATUS_LINE" ]; then
-            echo -e "Dernier Statut  : ${CYAN}$STATUS_LINE${NC}"
+            echo -e "Résultat Test   : ${GREEN}$STATUS_LINE${NC}"
         else
-            echo -e "Dernier Statut  : ${RED}Pas de réponse (Timeout ?)${NC}"
+            echo -e "Résultat Test   : ${RED}Pas de réponse (Timeout ?)${NC}"
         fi
-        
         rm /tmp/tg_debug.log
     fi
 fi
 
-# 7. LOGS ERROR (Filtrés)
+# 7. LOGS ERROR (Filtrage agressif)
 echo -e "\n${YELLOW}[7] LOGS ERREURS (Derniers 5)${NC}"
-# On filtre le bruit inutile (PulseAudio, VNC updates)
-journalctl -p 3 -xb --no-pager | grep -vE "pulseaudio|GetManagedObjects|vncserver" | tail -n 5 | while read line; do
+# Ajout filtre pipewire, hpfax, etc.
+journalctl -p 3 -xb --no-pager | grep -vE "pulseaudio|GetManagedObjects|vncserver|pipewire|hpfax|org.freedesktop" | tail -n 5 | while read line; do
     echo -e "${RED}> $line${NC}"
 done || echo "Rien à signaler."
 
