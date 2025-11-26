@@ -1,109 +1,152 @@
 #!/bin/bash
 
-# Couleurs pour la lisibilité
+# ==========================================================
+# DIAGNOSTIC RASPBERRY PI - V3.0 (Ultimate)
+# ==========================================================
+
+# 0. AUTO-ÉLÉVATION SUDO
+# Si l'utilisateur n'est pas root, on relance le script avec sudo
+if [ "$EUID" -ne 0 ]; then
+    echo "Besoin des droits administrateur..."
+    exec sudo /bin/bash "$0" "$@"
+    exit
+fi
+
+# Couleurs
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
+NC='\033[0m'
 
 echo -e "${BLUE}==========================================================${NC}"
-echo -e "${BLUE}       DIAGNOSTIC COMPLET DU RASPBERRY PI                 ${NC}"
+echo -e "${BLUE}       DIAGNOSTIC COMPLET DU RASPBERRY PI (V3.0)          ${NC}"
 echo -e "${BLUE}==========================================================${NC}"
 date
 echo ""
 
-# 1. VÉRIFICATION DU MATÉRIEL (Voltage & Température)
-echo -e "${YELLOW}[1] SANTÉ MATÉRIELLE (Voltage & Température)${NC}"
-TEMP=$(vcgencmd measure_temp)
-VOLT=$(vcgencmd get_throttled)
+# 1. INFO SYSTÈME & HEURE
+echo -e "${YELLOW}[1] SYSTÈME & HORLOGE${NC}"
+MODEL=$(cat /proc/device-tree/model 2>/dev/null || echo "Modèle inconnu")
+KERNEL=$(uname -r)
 UPTIME=$(uptime -p)
 
-echo -e "Température CPU : ${TEMP}"
-echo -e "Uptime          : ${UPTIME}"
+echo -e "Modèle          : ${CYAN}$MODEL${NC}"
+echo -e "Kernel          : $KERNEL"
+echo -e "Uptime          : $UPTIME"
 
-# Analyse du code Throttled (Voltage)
-if [[ "$VOLT" == "throttled=0x0" ]]; then
-    echo -e "Alimentation    : ${GREEN}OK (Pas de sous-tension détectée)${NC}"
+# Vérification NTP (Time Sync) - Crucial pour RPi
+NTP_STATUS=$(timedatectl show -p NTPSynchronized --value)
+if [[ "$NTP_STATUS" == "yes" ]]; then
+    echo -e "Synchro Heure   : ${GREEN}OK (NTP Actif)${NC}"
 else
-    echo -e "Alimentation    : ${RED}ATTENTION ! Problème détecté ($VOLT)${NC}"
-    echo "                  -> Si != 0x0, change ton alimentation ou ton câble USB."
+    echo -e "Synchro Heure   : ${RED}NON SYNCHRONISÉ ! (Risque d'erreurs APT/SSL)${NC}"
 fi
 
-# 2. SYSTÈME DE FICHIERS & CARTE SD
-echo -e "\n${YELLOW}[2] DISQUE & CARTE SD${NC}"
-# Vérification si le système est passé en Read-Only
-RO_CHECK=$(grep "ro," /proc/mounts | grep "ext4")
-if [[ -n "$RO_CHECK" ]]; then
-    echo -e "${RED}ALERTE CRITIQUE : Le système est monté en LECTURE SEULE (Read-Only) !${NC}"
-    echo "$RO_CHECK"
+# 2. SANTÉ MATÉRIELLE
+echo -e "\n${YELLOW}[2] SANTÉ MATÉRIELLE${NC}"
+TEMP=$(vcgencmd measure_temp | egrep -o '[0-9]*\.[0-9]*')
+STATUS=$(vcgencmd get_throttled | awk -F= '{print $2}')
+STATUS_DEC=$((STATUS))
+
+# Couleur Température
+if (( $(echo "$TEMP > 75.0" | bc -l) )); then COLOR_TEMP=$RED
+elif (( $(echo "$TEMP > 60.0" | bc -l) )); then COLOR_TEMP=$YELLOW
+else COLOR_TEMP=$GREEN; fi
+echo -e "Température CPU : ${COLOR_TEMP}${TEMP}°C${NC}"
+
+# Analyse Voltage
+echo -n "Alimentation    : "
+if [[ "$STATUS" == "0x0" ]]; then
+    echo -e "${GREEN}Parfaite (0x0)${NC}"
 else
-    echo -e "${GREEN}Système de fichiers en écriture (RW) : OK${NC}"
+    echo -e "${RED}PROBLÈME ($STATUS)${NC}"
+    if (( (STATUS_DEC & 0x1) != 0 )); then echo -e "   -> ${RED}ACTUELLEMENT en sous-tension !${NC}"; fi
+    if (( (STATUS_DEC & 0x10000) != 0 )); then echo -e "   -> ${YELLOW}Sous-tension historique (depuis le boot)${NC}"; fi
 fi
 
-# Espace disque
-df -h / | awk 'NR==2 {print "Espace Disque   : Utilisé "$3" sur "$2" ("$5")"}'
-
-# Recherche d'erreurs I/O récentes (Signe de mort de carte SD)
-echo -e "Erreurs I/O (dmesg) :"
-dmesg | grep -Ei "I/O error|EXT4-fs error|mmcblk0: error" | tail -n 5 || echo "Aucune erreur récente visible."
-
-# 3. MÉMOIRE & SWAP
-echo -e "\n${YELLOW}[3] MÉMOIRE (RAM & SWAP)${NC}"
-free -h
-# Alerte si le Swap est utilisé
-SWAP_USED=$(free | grep Swap | awk '{print $3}')
-if [[ "$SWAP_USED" -gt 0 ]]; then
-    echo -e "${RED}ATTENTION : Le SWAP est utilisé ! Cela tue ta carte SD.${NC}"
+# 3. DISQUE & I/O
+echo -e "\n${YELLOW}[3] STOCKAGE (SD/SSD)${NC}"
+# Vérif Read-Only
+if grep -q "ro," /proc/mounts | grep -q "ext4"; then
+    echo -e "${RED}ALERTE : Système en READ-ONLY !${NC}"
 else
-    echo -e "${GREEN}Swap non utilisé : OK${NC}"
+    echo -e "Mode Écriture   : ${GREEN}RW (OK)${NC}"
 fi
 
-# 4. SERVICES & PROCESSUS
-echo -e "\n${YELLOW}[4] SERVICES CRITIQUES${NC}"
-# Vérification des services communs
-for service in ssh apache2 mysql mariadb grafana-server php7.3-fpm php8.1-fpm; do
-    systemctl is-active --quiet $service && echo -e "$service : ${GREEN}ACTIF${NC}" || echo -e "$service : ${RED}INACTIF ou NON INSTALLÉ${NC}"
+# Espace disque racine
+df -h / | awk 'NR==2 {
+    usage=$5; sub("%", "", usage);
+    if (usage > 90) c="\033[0;31m"; else if (usage > 75) c="\033[1;33m"; else c="\033[0;32m";
+    print "Espace Utilisé  : "c$5"\033[0m ("$3" / "$2")"
+}'
+
+# 4. MÉMOIRE & PROCESSUS GOURMANDS
+echo -e "\n${YELLOW}[4] MÉMOIRE & PROCESSUS${NC}"
+free -h | awk 'NR==2{printf "RAM             : %s / %s (Libre: %s)\n", $3,$2,$4}'
+
+# Top 3 CPU
+echo -e "${PURPLE}--- Top 3 Consommation CPU ---${NC}"
+ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -n 4 | awk '{printf "%-6s %-6s %-5s %s\n", $1, $5"%", $4"%", $3}' | grep -v PID
+
+# Top 3 RAM
+echo -e "${PURPLE}--- Top 3 Consommation RAM ---${NC}"
+ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%mem | head -n 4 | awk '{printf "%-6s %-6s %-5s %s\n", $1, $5"%", $4"%", $3}' | grep -v PID
+
+# 5. RÉSEAU & WI-FI
+echo -e "\n${YELLOW}[5] RÉSEAU${NC}"
+hostname -I | awk '{print "IP Locale       : " $1}'
+
+# Test Internet
+if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+    echo -e "Internet        : ${GREEN}Connecté${NC}"
+else
+    echo -e "Internet        : ${RED}DÉCONNECTÉ${NC}"
+fi
+
+# Analyse Wi-Fi (si présent)
+if iwconfig 2>/dev/null | grep -q "IEEE 802.11"; then
+    WIFI_QUAL=$(iwconfig 2>/dev/null | grep "Link Quality" | awk -F'=' '{print $2}' | awk '{print $1}')
+    # Extraction numérateur/dénominateur
+    NUM=$(echo $WIFI_QUAL | cut -d/ -f1)
+    
+    if [ "$NUM" -ge 50 ]; then WIFI_COLOR=$GREEN
+    elif [ "$NUM" -ge 30 ]; then WIFI_COLOR=$YELLOW
+    else WIFI_COLOR=$RED; fi
+    
+    echo -e "Signal Wi-Fi    : ${WIFI_COLOR}$WIFI_QUAL${NC} (ESSID: $(iwgetid -r))"
+else
+    echo -e "Wi-Fi           : Non détecté ou Ethernet uniquement"
+fi
+
+# 6. SÉCURITÉ & LOGS
+echo -e "\n${YELLOW}[6] SÉCURITÉ & LOGS${NC}"
+
+# Tentatives SSH échouées
+if [ -f /var/log/auth.log ]; then
+    FAIL_COUNT=$(grep "Failed password" /var/log/auth.log | wc -l)
+    if [ "$FAIL_COUNT" -gt 50 ]; then
+        echo -e "Intrusions SSH  : ${RED}$FAIL_COUNT tentatives échouées ! (Check tes ports)${NC}"
+    else
+        echo -e "Intrusions SSH  : ${GREEN}$FAIL_COUNT (Normal)${NC}"
+    fi
+fi
+
+echo -e "${PURPLE}--- Dernières erreurs critiques ---${NC}"
+journalctl -p 3 -xb --no-pager | tail -n 3 | while read line; do
+    echo -e "${RED}> $line${NC}"
+done || echo "Rien à signaler."
+
+# 7. SERVICES
+echo -e "\n${YELLOW}[7] SERVICES CLÉS${NC}"
+# Liste simplifiée et dynamique
+SERVICES="ssh apache2 mariadb docker homeassistant nodered cron"
+for service in $SERVICES; do
+    if systemctl list-units --full -all | grep -Fq "$service.service"; then
+        systemctl is-active --quiet $service && echo -e "$service : ${GREEN}OK${NC}" || echo -e "$service : ${RED}KO${NC}"
+    fi
 done
 
-# Services en échec
-echo -e "\nServices en erreur (failed) :"
-systemctl list-units --state=failed --no-pager || echo "Aucun service en échec."
-
-# 5. CRONTABS (La source de tes problèmes)
-echo -e "\n${YELLOW}[5] TÂCHES PLANIFIÉES (CRON)${NC}"
-echo -e "${BLUE}--- Crontab de l'utilisateur courant ($(whoami)) ---${NC}"
-crontab -l 2>/dev/null | grep -v "^#" | grep -v "^$" || echo "Vide"
-
-echo -e "${BLUE}--- Crontab ROOT (Attention aux reboots cachés) ---${NC}"
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}Il faut lancer ce script avec SUDO pour voir le cron root !${NC}"
-else
-    crontab -u root -l 2>/dev/null | grep -v "^#" | grep -v "^$" || echo "Vide"
-fi
-
-# 6. RÉSEAU & PORTS
-echo -e "\n${YELLOW}[6] RÉSEAU${NC}"
-# IP locale
-hostname -I | awk '{print "IP Locale       : " $1}'
-# Ports en écoute
-echo "Ports en écoute (Services accessibles) :"
-if [ "$EUID" -ne 0 ]; then
-    echo "Requis sudo pour voir les processus liés aux ports."
-    ss -tln
-else
-    ss -tlnp | grep LISTEN | awk '{print $4, $6}' | head -n 10
-fi
-
-# 7. LOGS SYSTÈME RÉCENTS
-echo -e "\n${YELLOW}[7] DERNIERS LOGS CRITIQUES (Journalctl)${NC}"
-# Cherche les erreurs graves des dernières 24h
-if [ "$EUID" -ne 0 ]; then
-    echo "Requis sudo pour lire les logs système."
-else
-    journalctl -p 3 -xb --no-pager | tail -n 10 || echo "Pas d'erreurs critiques trouvées dans ce boot."
-fi
-
 echo -e "\n${BLUE}==========================================================${NC}"
-echo -e "${BLUE}                  FIN DU DIAGNOSTIC                       ${NC}"
-echo -e "${BLUE}==========================================================${NC}"
