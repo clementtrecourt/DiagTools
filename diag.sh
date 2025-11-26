@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================================
-# DIAGNOSTIC SYSTÈME UNIVERSEL (RPI & LINUX) - V4.1
+# DIAGNOSTIC SYSTÈME & IMPRIMANTE (V5.0)
 # ==========================================================
 
 # 0. VÉRIFICATION ROOT
@@ -44,56 +44,32 @@ echo ""
 echo -e "${YELLOW}[1] SYSTÈME & HORLOGE${NC}"
 
 if [ "$IS_RPI" = true ]; then
-    # Correction du bug "octet nul" avec tr -d '\0'
     MODEL=$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')
 else
     MODEL=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || hostnamectl | grep "Chassis" | awk '{print $2}')
     [ -z "$MODEL" ] && MODEL="PC / Serveur Inconnu"
 fi
-
-KERNEL=$(uname -r)
-UPTIME=$(uptime -p)
-
 echo -e "Modèle          : ${CYAN}$MODEL${NC}"
-echo -e "Kernel          : $KERNEL"
-echo -e "Uptime          : $UPTIME"
+echo -e "Uptime          : $(uptime -p)"
 
 NTP_STATUS=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
 if [[ "$NTP_STATUS" == "yes" ]]; then
     echo -e "Synchro Heure   : ${GREEN}OK (NTP Actif)${NC}"
 else
-    echo -e "Synchro Heure   : ${YELLOW}Inactif ou Non géré par systemd${NC}"
+    echo -e "Synchro Heure   : ${YELLOW}Inactif ou Non géré${NC}"
 fi
 
 # 2. SANTÉ MATÉRIELLE
 echo -e "\n${YELLOW}[2] SANTÉ MATÉRIELLE${NC}"
-
 if [ "$IS_RPI" = true ]; then
     TEMP=$(vcgencmd measure_temp | egrep -o '[0-9]*\.[0-9]*')
     STATUS=$(vcgencmd get_throttled | awk -F= '{print $2}')
-    STATUS_DEC=$((STATUS))
-    
     if (( $(echo "$TEMP > 75.0" | bc -l) )); then C=$RED; elif (( $(echo "$TEMP > 60.0" | bc -l) )); then C=$YELLOW; else C=$GREEN; fi
     echo -e "Température CPU : ${C}${TEMP}°C${NC}"
-
     echo -n "Alimentation    : "
-    if [[ "$STATUS" == "0x0" ]]; then
-        echo -e "${GREEN}Parfaite (0x0)${NC}"
-    else
-        echo -e "${RED}PROBLÈME ($STATUS)${NC}"
-        if (( (STATUS_DEC & 0x1) != 0 )); then echo -e "   -> ${RED}ACTUELLEMENT en sous-tension !${NC}"; fi
-        if (( (STATUS_DEC & 0x10000) != 0 )); then echo -e "   -> ${YELLOW}Sous-tension historique${NC}"; fi
-    fi
+    if [[ "$STATUS" == "0x0" ]]; then echo -e "${GREEN}Parfaite (0x0)${NC}"; else echo -e "${RED}PROBLÈME ($STATUS)${NC}"; fi
 else
-    # Mode PC
-    TEMP_FILE=$(find /sys/class/thermal/thermal_zone*/temp | head -n 1)
-    if [ -f "$TEMP_FILE" ]; then
-        TEMP_RAW=$(cat "$TEMP_FILE")
-        TEMP=$(echo "$TEMP_RAW / 1000" | bc)
-        echo -e "Température CPU : ${GREEN}${TEMP}°C${NC}"
-    else
-        echo -e "Température CPU : Non disponible (VM ou capteur absent)"
-    fi
+    echo -e "Température CPU : (Mode PC - Non affiché)"
 fi
 
 # 3. STOCKAGE
@@ -103,7 +79,6 @@ if grep -q "ro," /proc/mounts | grep -w "/" | grep -q "ext4"; then
 else
     echo -e "Mode Écriture   : ${GREEN}RW (OK)${NC}"
 fi
-
 df -h / | awk 'NR==2 {
     usage=$5; sub("%", "", usage);
     if (usage > 90) c="\033[0;31m"; else if (usage > 75) c="\033[1;33m"; else c="\033[0;32m";
@@ -113,75 +88,82 @@ df -h / | awk 'NR==2 {
 # 4. MÉMOIRE & PROCESSUS
 echo -e "\n${YELLOW}[4] MÉMOIRE & PROCESSUS${NC}"
 free -h | awk 'NR==2{printf "RAM             : %s / %s (Libre: %s)\n", $3,$2,$4}'
-
-# Formatage propre des colonnes (PID, CPU, MEM, NOM)
 echo -e "${PURPLE}--- Top 3 CPU ---${NC}"
 echo "PID    %CPU  %MEM  PROCESSUS"
 ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -n 4 | tail -n 3 | awk '{printf "%-6s %-5s %-5s %s\n", $1, $2"%", $3"%", $4}'
 
-echo -e "${PURPLE}--- Top 3 RAM ---${NC}"
-echo "PID    %CPU  %MEM  PROCESSUS"
-ps -eo pid,%cpu,%mem,comm --sort=-%mem | head -n 4 | tail -n 3 | awk '{printf "%-6s %-5s %-5s %s\n", $1, $2"%", $3"%", $4}'
-
 # 5. RÉSEAU
 echo -e "\n${YELLOW}[5] RÉSEAU${NC}"
 hostname -I | awk '{print "IP Locale       : " $1}'
+if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then echo -e "Internet        : ${GREEN}Connecté${NC}"; else echo -e "Internet        : ${RED}DÉCONNECTÉ${NC}"; fi
 
-if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
-    echo -e "Internet        : ${GREEN}Connecté${NC}"
+# 6. IMPRIMANTE TG2460 (CUSTOM)
+echo -e "\n${YELLOW}[6] IMPRIMANTE TG2460${NC}"
+
+# Recherche du binaire ReadStatus dans les dossiers home
+TG_BIN=$(find /home -name "ReadStatus" -type f 2>/dev/null | head -n 1)
+
+if [ -z "$TG_BIN" ]; then
+    echo -e "Programme       : ${RED}Non trouvé (ReadStatus introuvable)${NC}"
 else
-    echo -e "Internet        : ${RED}DÉCONNECTÉ${NC}"
-fi
-
-if command -v iwconfig &> /dev/null; then
-    # On vérifie si une interface sans fil a une connexion active
-    WIFI_INTERFACE=$(iwconfig 2>/dev/null | grep -v "no wireless" | grep "IEEE" | awk '{print $1}')
+    TG_DIR=$(dirname "$TG_BIN")
+    echo -e "Chemin          : $TG_DIR"
     
-    if [ ! -z "$WIFI_INTERFACE" ]; then
-        WIFI_QUAL=$(iwconfig $WIFI_INTERFACE | grep "Link Quality" | awk -F'=' '{print $2}' | awk '{print $1}')
-        ESSID=$(iwgetid -r)
-        NUM=$(echo $WIFI_QUAL | cut -d/ -f1)
-        
-        if [[ "$NUM" =~ ^[0-9]+$ ]]; then
-             if [ "$NUM" -ge 50 ]; then C=$GREEN; elif [ "$NUM" -ge 30 ]; then C=$YELLOW; else C=$RED; fi
-             echo -e "Signal Wi-Fi    : ${C}$WIFI_QUAL${NC} (ESSID: $ESSID)"
-        else
-             echo -e "Wi-Fi           : Activé mais pas de Link Quality"
-        fi
+    # Check USB (VID:PID 0DD4:0195)
+    if lsusb | grep -qi "0dd4:0195"; then
+        echo -e "Connexion USB   : ${GREEN}OK (Périphérique détecté)${NC}"
     else
-        echo -e "Wi-Fi           : Non connecté ou Ethernet utilisé"
+        echo -e "Connexion USB   : ${RED}NON DÉTECTÉE (Vérifier câble)${NC}"
     fi
-else
-    echo -e "Wi-Fi           : Outil non installé"
+
+    # Config
+    if [ -f "$TG_DIR/printer.cfg" ]; then
+        API_HOST=$(grep "API_HOST" "$TG_DIR/printer.cfg" | cut -d= -f2 | tr -d '\r')
+        echo -e "Cible API       : $API_HOST"
+    fi
+
+    # Check Processus
+    PID_TG=$(pgrep -f "ReadStatus")
+    if [ ! -z "$PID_TG" ]; then
+        echo -e "Processus       : ${GREEN}EN COURS (PID $PID_TG)${NC}"
+        echo "Note : Impossible de lancer le test manuel car le processus tourne déjà."
+    else
+        echo -e "Processus       : ${YELLOW}ARRÊTÉ${NC}"
+        echo -e "${PURPLE}--- Test de lancement (3 sec) ---${NC}"
+        
+        # On lance ReadStatus avec un timeout de 3 secondes pour ne pas bloquer le script
+        # On redirige la sortie vers un fichier temporaire pour l'analyser
+        cd "$TG_DIR"
+        timeout 3s ./ReadStatus > /tmp/tg_debug.log 2>&1
+        
+        # Analyse du log
+        if grep -q "CeSmLm.so version" /tmp/tg_debug.log; then
+            VER=$(grep "CeSmLm.so version" /tmp/tg_debug.log)
+            echo -e "Version Lib     : ${GREEN}$VER${NC}"
+        else
+            echo -e "Version Lib     : ${RED}Erreur de chargement${NC}"
+        fi
+        
+        if grep -q "HTTP/1.1 200 OK" /tmp/tg_debug.log; then
+            echo -e "Test API        : ${GREEN}SUCCÈS (200 OK)${NC}"
+        else
+            echo -e "Test API        : ${RED}ÉCHEC ou Pas de réponse${NC}"
+        fi
+        
+        # Afficher le dernier statut connu
+        STATUS_LINE=$(grep "Changement status" /tmp/tg_debug.log | tail -n 1)
+        if [ ! -z "$STATUS_LINE" ]; then
+            echo -e "Dernier Statut  : ${CYAN}$STATUS_LINE${NC}"
+        fi
+        
+        rm /tmp/tg_debug.log
+    fi
 fi
 
-# 6. LOGS & SÉCURITÉ
-echo -e "\n${YELLOW}[6] LOGS & SÉCURITÉ${NC}"
-if [ -f /var/log/auth.log ]; then
-    FAIL_COUNT=$(grep "Failed password" /var/log/auth.log | wc -l)
-    echo -e "Intrusions SSH  : $FAIL_COUNT tentatives échouées"
-else
-    echo -e "Intrusions SSH  : (Fichier log non standard)"
-fi
-
-echo -e "${PURPLE}--- Dernières erreurs (Journalctl) ---${NC}"
-# Filtre le bruit habituel (PulseAudio, etc) pour voir les vrais problèmes
-journalctl -p 3 -xb --no-pager | grep -v "pulseaudio" | grep -v "GetManagedObjects" | tail -n 3 | while read line; do
+# 7. LOGS ERROR (Filtrés)
+echo -e "\n${YELLOW}[7] LOGS ERREURS (Derniers 5)${NC}"
+journalctl -p 3 -xb --no-pager | grep -vE "pulseaudio|GetManagedObjects|vncserver" | tail -n 5 | while read line; do
     echo -e "${RED}> $line${NC}"
 done || echo "Rien à signaler."
-
-# 7. SERVICES
-echo -e "\n${YELLOW}[7] SERVICES CLÉS${NC}"
-# J'ai ajouté vncserver et lightdm car présents dans tes logs
-SERVICES="ssh sshd apache2 nginx mariadb docker cron smbd vncserver-x11-serviced lightdm"
-for service in $SERVICES; do
-    if systemctl list-unit-files "$service.service" &>/dev/null; then
-        if systemctl is-active --quiet $service; then
-            echo -e "$service : ${GREEN}OK${NC}"
-        else
-            echo -e "$service : ${RED}KO (Arrêté)${NC}"
-        fi
-    fi
-done
 
 echo -e "\n${BLUE}==========================================================${NC}"
